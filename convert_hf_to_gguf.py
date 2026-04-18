@@ -2365,6 +2365,17 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
         if name.startswith("mtp."):
             return []
 
+        # Qwen3-Next / Qwen3.5 / Qwen3.6 store RMS-norm weights as
+        # (actual_scale - 1), so the typical learned scale near 1.0 is
+        # represented near 0.0 on disk. Add 1 back at convert time;
+        # without this every norm runs at near-zero scale, activations
+        # collapse, softmax goes near-uniform, and decode produces the
+        # mode-shifting peaked-but-wrong gibberish we observed. Excludes
+        # linear_attn.norm.weight which uses the standard convention.
+        # Source: upstream Qwen3NextModel.modify_tensors (convert_hf_to_gguf.py:4781).
+        if name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+            data_torch = data_torch + 1
+
         # Linear-attention (Gated DeltaNet) tensor transforms.
         if ".linear_attn." in name:
             num_k_heads = self.hparams.get("linear_num_key_heads", 0)
