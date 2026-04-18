@@ -2284,6 +2284,23 @@ class Qwen3_5TextModel(Qwen2Model):
 class Qwen3_5MoeTextModel(Qwen3NextModel):
     model_arch = gguf.MODEL_ARCH.QWEN35MOE
 
+    @staticmethod
+    def _reorder_v_heads(tensor: Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> Tensor:
+        """Reorder V heads from grouped-by-K-head order to tiled order along `dim`.
+
+        HF stores: [G0_v0..v{r-1}, G1_v0..v{r-1}, ...]  where r = num_v_per_k
+        ggml wants: [G0_v0, G1_v0, ..., G0_v1, G1_v1, ...]
+        See upstream llama.cpp PR 19468 / _LinearAttentionVReorderBase.
+        """
+        shape = list(tensor.shape)
+        if dim < 0:
+            dim += len(shape)
+        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
+        tensor = tensor.reshape(*new_shape)
+        perm = list(range(len(new_shape)))
+        perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+        return tensor.permute(*perm).contiguous().reshape(*shape)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
@@ -2350,6 +2367,53 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
 
         # Linear-attention (Gated DeltaNet) tensor transforms.
         if ".linear_attn." in name:
+            num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+            num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+
+            # V-head reorder: ggml binary ops broadcast V heads tiled; HF stores
+            # them grouped by K head. Without this reorder every V-space op
+            # (scan, alpha/beta gate, conv1d V channels, out_proj columns) is
+            # misaligned and decode collapses to repeated tokens.
+            # Upstream: convert_hf_to_gguf.py _LinearAttentionVReorderBase.
+            if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads:
+                head_k_dim = self.hparams["linear_key_head_dim"]
+                head_v_dim = self.hparams["linear_value_head_dim"]
+                num_v_per_k = num_v_heads // num_k_heads
+
+                if name.endswith(".linear_attn.in_proj_qkv.weight"):
+                    q_dim = head_k_dim * num_k_heads
+                    k_dim = head_k_dim * num_k_heads
+                    q = data_torch[:q_dim]
+                    k = data_torch[q_dim:q_dim + k_dim]
+                    v = data_torch[q_dim + k_dim:]
+                    v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
+                    data_torch = torch.cat([q, k, v], dim=0)
+                elif name.endswith(".linear_attn.in_proj_z.weight"):
+                    data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
+                elif name.endswith(".linear_attn.in_proj_b.weight") or name.endswith(".linear_attn.in_proj_a.weight"):
+                    data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
+                elif name.endswith(".linear_attn.A_log") or name.endswith(".linear_attn.dt_bias"):
+                    if data_torch.ndim == 1:
+                        data_torch = self._reorder_v_heads(
+                            data_torch.unsqueeze(-1), 0, num_k_heads, num_v_per_k, 1
+                        ).squeeze(-1)
+                    else:
+                        data_torch = self._reorder_v_heads(data_torch, -1, num_k_heads, num_v_per_k, 1)
+                elif name.endswith(".linear_attn.conv1d.weight"):
+                    data = data_torch.squeeze()
+                    qk_channels = head_k_dim * num_k_heads * 2
+                    qk_part = data[:qk_channels]
+                    v_part = data[qk_channels:]
+                    v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
+                    data_torch = torch.cat([qk_part, v_part], dim=0)
+                    # Remaining transforms below expect the name; fall through to
+                    # the numeric/rename block so super() gets the squeezed tensor.
+                elif name.endswith(".linear_attn.out_proj.weight"):
+                    # out_proj is [n_embd, value_dim]; V heads live in the input
+                    # (column) dimension, so reorder along dim=1.
+                    data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
+
+            # Numeric transforms (order matters: reorder first, then these).
             if name.endswith(".A_log"):
                 # GGML stores A as -exp(A_log); apply the transform here so the
                 # kernel can use it directly.
@@ -2360,6 +2424,8 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
                 name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
             elif name.endswith(".conv1d.weight"):
                 # conv1d weight ships as (C, 1, K); ggml_ssm_conv expects (C, K).
+                # Note: if we reordered above the squeeze is already applied;
+                # calling squeeze() on an already-2D tensor is a no-op.
                 data_torch = data_torch.squeeze()
 
         # Packed MoE experts (Qwen3.5/3.6 layout):
