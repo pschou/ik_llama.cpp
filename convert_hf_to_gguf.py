@@ -2341,6 +2341,16 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
 
         return super().modify_tensors(data_torch, name, bid)
 
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # Packed MoE expert tensors ship without the ".weight" suffix (e.g.
+        # "model.layers.0.mlp.experts.down_proj"). The base prepare_tensors
+        # loop sees a suffix-less source name and forces F32; returning True
+        # here respects --outtype instead so packed experts quantize like
+        # shared experts (BF16 by default).
+        if new_name.endswith("_exps.weight"):
+            return True
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
 
 @Model.register("Ernie4_5_ForCausalLM", "Ernie4_5ForCausalLM")
 class Ernie4_5Model(Model):
