@@ -201,6 +201,18 @@ class Model:
             raise ValueError(f"Can not map tensor {name!r}")
         return new_name
 
+    def _strip_vlm_prefixes(self, name: str) -> str | None:
+        # VLM wrappers (Qwen2/3-VL, etc.) place vision tensors under
+        # `model.visual.*` and wrap the language model under
+        # `model.language_model.*`. Vision tensors convert in a separate
+        # mmproj pass; return None to signal skip. Otherwise strip the
+        # language_model prefix so the standard tensor_map applies.
+        if name.startswith("model.visual."):
+            return None
+        if name.startswith("model.language_model."):
+            return name.replace("language_model.", "", 1)
+        return name
+
     def set_gguf_parameters(self):
         self.gguf_writer.add_block_count(self.block_count)
 
@@ -2352,16 +2364,10 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
     def modify_tensors(
         self, data_torch: Tensor, name: str, bid: int | None
     ) -> Iterable[tuple[str, Tensor]]:
-        # VLM wrapper: skip the vision tower. The 27-layer ViT gets converted
-        # in a separate mmproj pass (TODO: port Qwen3VLVisionModel).
-        if name.startswith("model.visual."):
+        stripped = self._strip_vlm_prefixes(name)
+        if stripped is None:
             return []
-        # Strip the VLM language-model prefix so the standard tensor mapping
-        # table (which expects "model.layers.N.*") applies.
-        if name.startswith("model.language_model."):
-            name = name.replace("language_model.", "", 1)
-        # Multi-token-prediction head. Runtime QWEN35MOE MTP wiring is a follow-up;
-        # for now drop these tensors so the text model converts cleanly.
+        name = stripped
         if name.startswith("mtp."):
             return []
 
@@ -2479,7 +2485,9 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
         # ships this tensor as bf16 so force F32 at convert time, matching
         # upstream llama.cpp. Keeps GGUF backend-portable (CPU-only load
         # otherwise segfaults in llm_load_tensors before any progress log).
-        if new_name.endswith("ssm_conv1d.weight"):
+        if bid is not None and new_name == self.format_tensor_name(
+            gguf.MODEL_TENSOR.SSM_CONV1D, bid, ".weight" if name.endswith(".weight") else ""
+        ):
             return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
