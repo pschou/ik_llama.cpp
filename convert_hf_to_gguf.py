@@ -2397,6 +2397,13 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
         # shared experts (BF16 by default).
         if new_name.endswith("_exps.weight"):
             return True
+        # The CPU ggml_compute_forward_ssm_conv_f32 kernel asserts that its
+        # conv1d weight is F32 (nb[0] == sizeof(float), ggml.c:22354). HF
+        # ships this tensor as bf16 so force F32 at convert time, matching
+        # upstream llama.cpp. Keeps GGUF backend-portable (CPU-only load
+        # otherwise segfaults in llm_load_tensors before any progress log).
+        if new_name.endswith("ssm_conv1d.weight"):
+            return gguf.GGMLQuantizationType.F32
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
