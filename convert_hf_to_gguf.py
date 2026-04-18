@@ -2314,6 +2314,31 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
                 # conv1d weight ships as (C, 1, K); ggml_ssm_conv expects (C, K).
                 data_torch = data_torch.squeeze()
 
+        # Packed MoE experts (Qwen3.5/3.6 layout):
+        #   mlp.experts.down_proj     ships as [n_expert, n_embd, n_ff]
+        #   mlp.experts.gate_up_proj  ships as [n_expert, 2*n_ff, n_embd] (gate|up concat)
+        # Parent Qwen2MoeModel.modify_tensors assumes the per-expert layout
+        # (mlp.experts.{xid}.down_proj.weight, ...), so we short-circuit here,
+        # yield directly with the GGUF-mapped name, and skip super().
+        if name.endswith("mlp.experts.down_proj") or name.endswith("mlp.experts.down_proj.weight"):
+            if not name.endswith(".weight"):
+                name = name + ".weight"
+            return [(self.map_tensor_name(name), data_torch)]
+
+        if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight"):
+            if data_torch.ndim < 3 or data_torch.shape[-2] % 2 != 0:
+                raise ValueError(
+                    f"Unexpected gate_up_proj shape for {name}: {tuple(data_torch.shape)}"
+                )
+            n_ff = data_torch.shape[-2] // 2
+            gate = data_torch[..., :n_ff, :].contiguous()
+            up   = data_torch[..., n_ff:, :].contiguous()
+            base = name[:-len(".weight")] if name.endswith(".weight") else name
+            base = base[:-len(".gate_up_proj")]
+            mapped_gate = self.map_tensor_name(base + ".gate_proj.weight")
+            mapped_up   = self.map_tensor_name(base + ".up_proj.weight")
+            return [(mapped_gate, gate), (mapped_up, up)]
+
         return super().modify_tensors(data_torch, name, bid)
 
 
