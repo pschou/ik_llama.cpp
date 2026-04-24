@@ -605,6 +605,20 @@ llama_model_loader::~llama_model_loader() {
     }
 }
 
+struct ggml_tensor * llama_model_loader::create_tensor_synthetic(struct ggml_context * ctx, const std::string & name,
+        const std::vector<int64_t> & ne, enum ggml_type type) {
+    // Create the tensor struct in the ggml context
+    ggml_tensor * tensor = ggml_new_tensor(ctx, type, ne.size(), ne.data());
+    ggml_set_name(tensor, name.c_str());
+
+    // Allocate zero-filled data storage
+    size_t nbytes = ggml_nbytes(tensor);
+    synthetic_tensors.push_back({tensor, std::vector<uint8_t>(nbytes, 0)});
+    tensor->data = synthetic_tensors.back().data.data();
+
+    return tensor;
+}
+
 void llama_model_loader::build_expert_tensor_index(const llama_hparams & hparams) {
     expert_tensor_index = {};
 
@@ -975,7 +989,12 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors() const {
-    if (n_created != n_tensors) {
+    if (n_created < n_tensors) {
+        // Some tensors in the GGUF file may not map to model tensors (e.g., MTP, value heads)
+        // This is expected and should not be treated as an error
+        fprintf(stderr, "warning: %s: %d of %d GGUF tensors were loaded (some tensors may not match the model architecture)\n",
+                __func__, n_created, n_tensors);
+    } else if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
     }
 }

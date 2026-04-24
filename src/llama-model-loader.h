@@ -86,6 +86,13 @@ struct llama_model_loader {
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
     llama_expert_tensor_index expert_tensor_index;
 
+    // Storage for synthetic tensor data (persists for model lifetime)
+    struct synthetic_tensor_data {
+        ggml_tensor * tensor;
+        std::vector<uint8_t> data;
+    };
+    std::vector<synthetic_tensor_data> synthetic_tensors;
+
     llama_model_loader(const std::string & fname, int ncmoe, bool use_mmap, bool check_tensors, bool repack_tensors, bool use_thp,
             bool merge_qkv, bool merge_up_gate_exps, bool defer_experts,
             const llama_model_kv_override * param_overrides_p,
@@ -157,6 +164,10 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base,
             const std::string & name, const std::vector<int64_t> & ne, size_t offset, bool required = true);
+
+    // Create a synthetic zero-filled tensor when the GGUF tensor is missing
+    struct ggml_tensor * create_tensor_synthetic(struct ggml_context * ctx, const std::string & name,
+            const std::vector<int64_t> & ne, enum ggml_type type);
 
     void done_getting_tensors() const;
 

@@ -1468,7 +1468,11 @@ bool create_tensors_helper::create_qwen3next_tensors(const LLM_TN & tn) {
             layer.wqkv_gate      = create_tensor(ctx_layer, tn(LLM_TENSOR_ATTN_GATE,      "weight", i), {n_embd, value_dim},
                     llama_model_loader::TENSOR_NOT_REQUIRED);
             layer.ssm_conv1d     = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_CONV1D,     "weight", i), {hparams.ssm_d_conv, conv_dim});
-            layer.ssm_dt         = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_DT,         "bias",   i), {hparams.ssm_dt_rank});
+            if (ml.get_weight(tn(LLM_TENSOR_SSM_DT, "bias", i).c_str()) != nullptr) {
+                layer.ssm_dt         = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_DT,         "bias",   i), {hparams.ssm_dt_rank});
+            } else {
+                layer.ssm_dt         = ml.create_tensor_synthetic(ctx_layer, tn(LLM_TENSOR_SSM_DT, "bias", i), {hparams.ssm_dt_rank}, hparams.ssm_dt_rank > 0 ? GGML_TYPE_F32 : GGML_TYPE_F16);
+            }
             layer.ssm_a          = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_A_NOSCAN,             i), {hparams.ssm_dt_rank});
             layer.ssm_beta_alpha = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_BETA_ALPHA, "weight", i), {n_embd, ba_dim});
             layer.ssm_norm       = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_NORM,       "weight", i), {head_v_dim});
@@ -1540,22 +1544,32 @@ bool create_tensors_helper::create_qwen35moe_tensors(const LLM_TN & tn) {
         layer.ffn_norm = layer.attn_post_norm;
 
         if (!hparams.is_recurrent(i)) {
-            // Attention layers
-            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head * 2 }, 0);
-            layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
-            layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
-            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
+            // Attention layers - use per-layer values since n_head_kv varies by layer
+            {
+                const int64_t n_head_i     = hparams.n_head(i);
+                const int64_t n_head_kv_i  = hparams.n_head_kv(i);
+                const int64_t n_embd_head_k_i = hparams.n_embd_head_k(i);
+                const int64_t n_embd_k_gqa_i = n_head_kv_i * n_embd_head_k_i;
+                layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k_i * n_head_i * 2 }, 0);
+                layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa_i }, 0);
+                layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_head_kv_i * n_embd_head_k_i }, 0);
+                layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k_i * n_head_i, n_embd }, 0);
 
-            // Q/K normalization for attention layers
-            layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
-            layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+                // Q/K normalization for attention layers
+                layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k_i }, 0);
+                layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k_i }, 0);
+            }
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
             layer.wqkv           = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV,       "weight", i), { n_embd, key_dim * 2 + value_dim }, 0);
             layer.wqkv_gate      = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE,      "weight", i), { n_embd, value_dim }, 0);
             layer.ssm_conv1d     = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_CONV1D,     "weight", i), { hparams.ssm_d_conv, conv_dim }, 0);
-            layer.ssm_dt         = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_DT,         "bias",   i), { hparams.ssm_dt_rank }, 0);
+            if (ml.get_weight(tn(LLM_TENSOR_SSM_DT, "bias", i).c_str()) != nullptr) {
+                layer.ssm_dt         = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_DT,         "bias",   i), { hparams.ssm_dt_rank }, 0);
+            } else {
+                layer.ssm_dt         = ml.create_tensor_synthetic(ctx_split, tn(LLM_TENSOR_SSM_DT, "bias", i), { hparams.ssm_dt_rank }, GGML_TYPE_F32);
+            }
             layer.ssm_a          = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_A_NOSCAN,             i), { hparams.ssm_dt_rank }, 0);
             layer.ssm_beta       = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_BETA,       "weight", i), { n_embd, n_v_heads }, 0);
             layer.ssm_alpha      = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_ALPHA,      "weight", i), { n_embd, n_v_heads }, 0);
@@ -1610,22 +1624,33 @@ bool create_tensors_helper::create_qwen35_tensors(const LLM_TN & tn) {
         layer.ffn_norm = layer.attn_post_norm;
 
         if (!hparams.is_recurrent(i)) {
-            // Attention layers
-            layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k * n_head * 2 }, 0);
-            layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa }, 0);
-            layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_embd_v_gqa }, 0);
-            layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k * n_head, n_embd }, 0);
+            // Attention layers - use per-layer values since n_head_kv varies by layer
+            {
+                const int64_t n_head_i     = hparams.n_head(i);
+                const int64_t n_head_kv_i  = hparams.n_head_kv(i);
+                const int64_t n_embd_head_k_i = hparams.n_embd_head_k(i);
+                const int64_t n_embd_k_gqa_i = n_head_kv_i * n_embd_head_k_i;
+                layer.wq = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q,   "weight", i), { n_embd, n_embd_head_k_i * n_head_i * 2 }, 0);
+                layer.wk = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K,   "weight", i), { n_embd, n_embd_k_gqa_i }, 0);
+                layer.wv = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_V,   "weight", i), { n_embd, n_head_kv_i * n_embd_head_k_i }, 0);
+                layer.wo = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_k_i * n_head_i, n_embd }, 0);
 
-            // Q/K normalization for attention layers
-            layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
-            layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+                // Q/K normalization for attention layers
+                layer.attn_q_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k_i }, 0);
+                layer.attn_k_norm = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k_i }, 0);
+            }
         } else {
             // Linear attention (gated delta net) specific tensors
+            // Recurrent layers don't have separate wk; it's embedded in wqkv
             // Create tensors with calculated dimensions
             layer.wqkv           = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_QKV,       "weight", i), { n_embd, key_dim * 2 + value_dim }, llama_model_loader::TENSOR_NOT_REQUIRED);
             layer.wqkv_gate      = create_tensor(ctx_split, tn(LLM_TENSOR_ATTN_GATE,      "weight", i), { n_embd, value_dim }, llama_model_loader::TENSOR_NOT_REQUIRED);
             layer.ssm_conv1d     = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_CONV1D,     "weight", i), { hparams.ssm_d_conv, conv_dim }, 0);
-            layer.ssm_dt         = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_DT,         "bias",   i), { hparams.ssm_dt_rank }, 0);
+            if (ml.get_weight(tn(LLM_TENSOR_SSM_DT, "bias", i).c_str()) != nullptr) {
+                layer.ssm_dt         = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_DT,         "bias",   i), { hparams.ssm_dt_rank }, 0);
+            } else {
+                layer.ssm_dt         = ml.create_tensor_synthetic(ctx_split, tn(LLM_TENSOR_SSM_DT, "bias", i), { hparams.ssm_dt_rank }, GGML_TYPE_F32);
+            }
             layer.ssm_a          = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_A_NOSCAN,             i), { hparams.ssm_dt_rank }, 0);
             layer.ssm_beta       = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_BETA,       "weight", i), { n_embd, n_v_heads }, 0);
             layer.ssm_alpha      = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_ALPHA,      "weight", i), { n_embd, n_v_heads }, 0);
@@ -2128,7 +2153,11 @@ bool create_tensors_helper::create_mamba_tensors(const LLM_TN & tn) {
         layer.ssm_x = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_X, "weight", i), {d_inner, dt_rank + 2*d_state});
 
         layer.ssm_dt = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_DT, "weight", i), {dt_rank, d_inner});
-        layer.ssm_dt_b = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner});
+        if (ml.get_weight(tn(LLM_TENSOR_SSM_DT, "bias", i).c_str()) != nullptr) {
+            layer.ssm_dt_b = create_tensor(ctx_layer, tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner});
+        } else {
+            layer.ssm_dt_b = ml.create_tensor_synthetic(ctx_layer, tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, GGML_TYPE_F32);
+        }
 
         // no "weight" suffix for these
         layer.ssm_a = create_tensor(ctx_split, tn(LLM_TENSOR_SSM_A, i), {d_state, d_inner});
