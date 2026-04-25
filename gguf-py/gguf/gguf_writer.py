@@ -770,6 +770,15 @@ class GGUFWriter:
     def add_expert_gating_func(self, value: ExpertGatingFuncType) -> None:
         self.add_uint32(Keys.LLM.EXPERT_GATING_FUNC.format(arch=self.arch), value.value)
 
+    def add_indexer_head_count(self, count: int) -> None:
+        self.add_uint32(Keys.LLM.INDEXER_HEAD_COUNT.format(arch=self.arch), count)
+
+    def add_indexer_key_length(self, length: int) -> None:
+        self.add_uint32(Keys.LLM.INDEXER_KEY_LENGTH.format(arch=self.arch), length)
+
+    def add_indexer_top_k(self, top_k: int) -> None:
+        self.add_uint32(Keys.LLM.INDEXER_TOP_K.format(arch=self.arch), top_k)
+
     def add_expert_group_scale(self, value: float) -> None:
         self.add_float32(Keys.LLM.EXPERT_GROUP_SCALE.format(arch=self.arch), value)
 

@@ -651,6 +651,12 @@ class Model:
         if chkhsh == "9ca2dd618e8afaf09731a7cf6e2105b373ba6a1821559f258b272fe83e6eb902":
             # ref: https://huggingface.co/zai-org/GLM-4.5-Air, https://huggingface.co/zai-org/GLM-4.5
             res = "glm4"
+        if chkhsh == "b70cd362a0d90c04ad007afbf0c8dcd4394c9581e1f9cc1c6c4c275c0b6e20d7":
+            # ref: https://huggingface.co/0xSero/glm-5-381-reap-w3a16 (GLM-5)
+            res = "glm4"
+        if chkhsh == "cdf5f35325780597efd76153d4d1c16778f766173908894c04afc20108536267":
+            # ref: GLM-5 local model
+            res = "glm4"
         if chkhsh == "7fc505bd3104ca1083b150b17d088b59534ede9bde81f0dd2090967d7fe52cee":
             # ref: https://huggingface.co/LumiOpen/Viking-7B
             res = "viking"
@@ -4985,7 +4991,266 @@ class Glm4MoeModel(Model):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
-@Model.register("GlmMoeDsaForCausalLM")class Glm5MoeDsaModel(Model):    """Converter for GLM-5 (GlmMoeDsaForCausalLM) with DSA (Dynamic Sparse Attention).    GLM5 uses LoRA-style decomposed attention (q_a_proj @ q_b_proj for queries,    kv_a_proj @ kv_b_proj for keys/values) and GPTQ-style quantized weights.    """    model_arch = gguf.MODEL_ARCH.GLM_DSA    def __init__(self, *args, **kwargs):        super().__init__(*args, **kwargs)        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)        self.first_k_dense = self.hparams.get("first_k_dense_replace", 0)        self.n_routed_experts = self.hparams.get("n_routed_experts", 0)        self.n_shared_experts = self.hparams.get("n_shared_experts", 0)        self.expert_ffn = self.hparams.get("moe_intermediate_size", 0)    def set_vocab(self):        from transformers import AutoTokenizer        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)        tokens, toktypes, tokpre = self.get_vocab_base()        self.gguf_writer.add_tokenizer_model("gpt2")        self.gguf_writer.add_tokenizer_pre("glm4")        self.gguf_writer.add_token_list(tokens)        self.gguf_writer.add_token_types(toktypes)        # Special tokens (same as GLM4)        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["[gMASK]"])        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|unk|>"])        special_vocab._set_special_token("eom", tokenizer.get_added_vocab()["<|observation|>"])        special_vocab.add_to_gguf(self.gguf_writer)    def set_gguf_parameters(self):        super().set_gguf_parameters()        # Standard params        self.gguf_writer.add_context_length(int(self.hparams["max_position_embeddings"]))        self.gguf_writer.add_embedding_length(int(self.hparams["hidden_size"]))        self.gguf_writer.add_feed_forward_length(int(self.hparams["intermediate_size"]))        # DSA attention params (MLA style)        self.gguf_writer.add_key_length(int(self.hparams.get("qk_head_dim", 0)))        self.gguf_writer.add_value_length(int(self.hparams.get("v_head_dim", 0)))        self.gguf_writer.add_key_length_mla(int(self.hparams.get("qk_nope_head_dim", 0)))        self.gguf_writer.add_value_length_mla(int(self.hparams.get("v_head_dim", 0)))        # DSA indexer params        self.gguf_writer.add_indexer_head_count(int(self.hparams.get("index_n_heads", 0)))        self.gguf_writer.add_indexer_key_length(int(self.hparams.get("index_head_dim", 0)))        self.gguf_writer.add_indexer_top_k(int(self.hparams.get("index_topk", 0)))        # MoE params        if self.n_routed_experts:            self.gguf_writer.add_expert_count(self.n_routed_experts)        if self.expert_ffn:            self.gguf_writer.add_expert_feed_forward_length(self.expert_ffn)        if self.n_shared_experts:            self.gguf_writer.add_expert_shared_count(self.n_shared_experts)        if self.first_k_dense:            self.gguf_writer.add_leading_dense_block_count(self.first_k_dense)        # Expert gating        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)        self.gguf_writer.add_expert_weights_scale(float(self.hparams.get("routed_scaling_factor", 1.0)))        if self.hparams.get("norm_topk_prob"):            self.gguf_writer.add_expert_weights_norm(True)        # NextN        if (num_nextn := self.hparams.get("num_nextn_predict_layers")) is not None:            self.gguf_writer.add_nextn_predict_layers(num_nextn)    def _extract_bid(self, name: str) -> int | None:        for part in name.split("."):            if part.isdigit():                return int(part)        return None    def modify_tensors(self, data_torch: torch.Tensor, name: str, bid: int | None) -> Iterable[tuple[str, torch.Tensor]]:        # Ignore visual part        if name.startswith("model.visual."):            return []        # Handle LoRA-style decomposed attention weights        if name.endswith(".q_a_proj.qweight"):            bid = self._extract_bid(name)            if bid is not None:                self._lora_tensors[bid]["q_a"] = data_torch.numpy()            return []        if name.endswith(".q_b_proj.qweight"):            bid = self._extract_bid(name)            if bid is not None:                self._lora_tensors[bid]["q_b"] = data_torch.numpy()            return []        if name.endswith(".kv_a_proj_with_mqa.qweight"):            bid = self._extract_bid(name)            if bid is not None:                self._lora_tensors[bid]["kv_a"] = data_torch.numpy()            return []        if name.endswith(".kv_b_proj.qweight"):            bid = self._extract_bid(name)            if bid is not None:                self._lora_tensors[bid]["kv_b"] = data_torch.numpy()            return []        # For all other tensors, map to GGUF names        new_name = self.map_tensor_name(name)        return [(new_name, data_torch)]    def _collect_lora(self, bid: int) -> list[tuple[str, torch.Tensor]]:        """Collect and merge LoRA-style decomposed attention weights."""        lora = self._lora_tensors.pop(bid, {})        if not lora:            return []        tensors: list[tuple[str, torch.Tensor]] = []        # Merge q_a @ q_b -> attn_q_a        q_a = lora.pop("q_a", None)        q_b = lora.pop("q_b", None)        if q_a is not None and q_b is not None:            merged = (q_a @ q_b).astype(np.float32)            tensors.append((self.map_tensor_name(f"model.layers.{bid}.self_attn.q_attn"),                          torch.from_numpy(merged)))        if q_b is not None:            q_b_np = q_b.astype(np.float32)            tensors.append((self.map_tensor_name(f"model.layers.{bid}.self_attn.q_b_attn"),                          torch.from_numpy(q_b_np)))        # Merge kv_a @ kv_b -> attn_kv_a_mqa        kv_a = lora.pop("kv_a", None)        kv_b = lora.pop("kv_b", None)        if kv_a is not None and kv_b is not None:            merged_kv = (kv_a @ kv_b).astype(np.float32)            tensors.append((self.map_tensor_name(f"model.layers.{bid}.self_attn.kv_attn"),                          torch.from_numpy(merged_kv)))        if kv_b is not None:            kv_b_np = kv_b.astype(np.float32)            tensors.append((self.map_tensor_name(f"model.layers.{bid}.self_attn.kv_b_attn"),                          torch.from_numpy(kv_b_np)))        return tensors    def generate_extra_tensors(self) -> Iterable[tuple[str, torch.Tensor]]:        """Yield LoRA-merged tensors."""        for bid in list(self._lora_tensors.keys()):            yield from self._collect_lora(bid)    def prepare_tensors(self):        super().prepare_tensors()        if self._lora_tensors:            raise ValueError(f"Unprocessed LoRA tensors: {list(self._lora_tensors.keys())}")@Model.register("ChatGLMModel", "ChatGLMForConditionalGeneration")class ChatGLMModel(Model):    model_arch = gguf.MODEL_ARCH.CHATGLM
+@Model.register("GlmMoeDsaForCausalLM")
+class Glm5MoeDsaModel(Model):
+    """Converter for GLM-5 (GlmMoeDsaForCausalLM) with DSA (Dynamic Sparse Attention).
+
+    GLM5 uses LoRA-style decomposed attention (q_a_proj @ q_b_proj for queries,
+    kv_a_proj @ kv_b_proj for keys/values) and GPTQ-style quantized weights.
+    """
+    model_arch = gguf.MODEL_ARCH.GLM_DSA
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+        self.first_k_dense = self.hparams.get("first_k_dense_replace", 0)
+        self.n_routed_experts = self.hparams.get("n_routed_experts", 0)
+        self.n_shared_experts = self.hparams.get("n_shared_experts", 0)
+        self.expert_ffn = self.hparams.get("moe_intermediate_size", 0)
+        self._q_tensors: dict[str, dict[str, np.ndarray]] = {}
+
+    def set_vocab(self):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        tokens, toktypes, tokpre = self.get_vocab_base()
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre("glm4")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(toktypes)
+
+        # Special tokens (GLM5 specific)
+        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["[gMASK]"])
+        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])
+        # GLM5 has no explicit unk token; use the first vocab entry
+        special_vocab._set_special_token("unk", tokenizer.decode([0]))
+        special_vocab._set_special_token("eom", tokenizer.get_added_vocab()["<|observation|>"])
+
+        special_vocab.add_to_gguf(self.gguf_writer)
+
+    def set_gguf_parameters(self):
+        # Call parent for base params (block_count, context_length, embedding_length, etc.)
+        # We need to override some values set by parent, so call it first
+        super().set_gguf_parameters()
+
+        # Standard params (redundant with parent but explicit)
+        self.gguf_writer.add_context_length(int(self.hparams["max_position_embeddings"]))
+        self.gguf_writer.add_embedding_length(int(self.hparams["hidden_size"]))
+        self.gguf_writer.add_feed_forward_length(int(self.hparams["intermediate_size"]))
+
+        # Override head_count_kv: GLM5 uses MLA with single KV head (all query heads share KV)
+        self.gguf_writer.add_head_count_kv(1)
+
+        # MLA dimensions
+        kv_lora_rank = int(self.hparams.get("kv_lora_rank", 0))
+        q_lora_rank = int(self.hparams.get("q_lora_rank", 0))
+        qk_head_dim = int(self.hparams.get("qk_head_dim", 0))
+        v_head_dim = int(self.hparams.get("v_head_dim", 0))
+        qk_nope_head_dim = int(self.hparams.get("qk_nope_head_dim", 0))
+        qk_rope_head_dim = qk_head_dim - qk_nope_head_dim  # rotary component of key
+
+        # key_length = full key dim = compressed_key_dim + rotary_dim
+        # In MLA: keys are projected to kv_lora_rank, then rotary dims are concatenated
+        self.gguf_writer.add_key_length(kv_lora_rank + qk_rope_head_dim)
+
+        # value_length = compressed value dim (GLM5 stores the pre-PCA dimension)
+        # In GLM5 MLA, values are projected to kv_lora_rank without additional dims
+        self.gguf_writer.add_value_length(kv_lora_rank)
+
+        # key_length_mla = dimension of keys after PCA projection (qk_head_dim)
+        self.gguf_writer.add_key_length_mla(qk_head_dim)
+
+        # value_length_mla = dimension of values after PCA projection (v_head_dim)
+        self.gguf_writer.add_value_length_mla(v_head_dim)
+
+        # q_lora_rank and kv_lora_rank (MLA latent dimensions)
+        self.gguf_writer.add_q_lora_rank(q_lora_rank)
+        self.gguf_writer.add_kv_lora_rank(kv_lora_rank)
+
+        # DSA indexer params
+        self.gguf_writer.add_indexer_head_count(int(self.hparams.get("index_n_heads", 0)))
+        self.gguf_writer.add_indexer_key_length(int(self.hparams.get("index_head_dim", 0)))
+        self.gguf_writer.add_indexer_top_k(int(self.hparams.get("index_topk", 0)))
+
+        # MoE params
+        if self.n_routed_experts:
+            self.gguf_writer.add_expert_count(self.n_routed_experts)
+        if self.expert_ffn:
+            self.gguf_writer.add_expert_feed_forward_length(self.expert_ffn)
+        if self.n_shared_experts:
+            self.gguf_writer.add_expert_shared_count(self.n_shared_experts)
+        if self.first_k_dense:
+            self.gguf_writer.add_leading_dense_block_count(self.first_k_dense)
+
+        # Expert groups
+        ep_size = self.hparams.get("ep_size", 1)
+        self.gguf_writer.add_expert_group_count(ep_size)
+        self.gguf_writer.add_expert_group_used_count(ep_size)
+
+        # vocab_size
+        if "vocab_size" in self.hparams:
+            self.gguf_writer.add_vocab_size(int(self.hparams["vocab_size"]))
+
+        # rope_dimension_count (only the rotary component, not the full hidden_size)
+        if qk_rope_head_dim > 0:
+            self.gguf_writer.add_rope_dimension_count(qk_rope_head_dim)
+
+        # rope_freq_base: GLM5 stores rope_theta inside rope_parameters dict
+        rope_theta = self.hparams.get("rope_theta")
+        if rope_theta is None:
+            rope_params = self.hparams.get("rope_parameters")
+            if isinstance(rope_params, dict):
+                rope_theta = rope_params.get("rope_theta")
+        if rope_theta is not None:
+            self.gguf_writer.add_rope_freq_base(float(rope_theta))
+
+        # Expert gating
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+        self.gguf_writer.add_expert_weights_scale(float(self.hparams.get("routed_scaling_factor", 1.0)))
+        if self.hparams.get("norm_topk_prob"):
+            self.gguf_writer.add_expert_weights_norm(True)
+
+        # NextN
+        if (num_nextn := self.hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(num_nextn)
+
+    def _extract_bid(self, name: str) -> int | None:
+        for part in name.split("."):
+            if part.isdigit():
+                return int(part)
+        return None
+
+    def _dequantize_gptq(self, qweight: np.ndarray, qzeros: np.ndarray, scales: np.ndarray) -> np.ndarray:
+        """Dequantize GPTQ-style quantized weights (AutoRound variant used by GLM5)."""
+        # AutoRound: qweight = int8, qzeros = int8 (midpoint=8), scales = float32
+        # dequantized = (qweight - (qzeros - 8)) * scales
+        try:
+            return (qweight - (qzeros.astype(np.int32) - 8)) * scales.astype(np.float32)
+        except Exception:
+            # Fallback: standard GPTQ formula
+            return (qweight - (qzeros - (1 << 7))) * scales
+
+    def _hf_to_gguf_indexer(self, name: str, bid: int) -> str | None:
+        """Map HF indexer tensor name to GGUF name, or None if it should be skipped."""
+        if "indexer.k_norm.weight" in name:
+            return f"blk.{bid}.indexer.k_norm.weight"
+        if "indexer.k_norm.bias" in name:
+            return f"blk.{bid}.indexer.k_norm.bias"
+        if "indexer.proj.weight" in name:
+            return f"blk.{bid}.indexer.proj"
+        if "indexer.wk" in name:
+            return f"blk.{bid}.indexer.attn_k"
+        if "indexer.wq_b" in name:
+            return f"blk.{bid}.indexer.attn_q_b"
+        # Skip quantization components (qzeros, scales)
+        if "qzeros" in name or "scales" in name:
+            return None
+        return None
+
+    def modify_tensors(self, data_torch: torch.Tensor, name: str, bid: int | None) -> Iterable[tuple[str, torch.Tensor]]:
+        # Ignore visual part
+        if name.startswith("model.visual."):
+            return []
+
+        # Buffer quantized tensors for later dequantization
+        if bid is not None and ".qweight" in name:
+            # Extract the base tensor name (without .qweight suffix)
+            base_name = name.rsplit(".", 1)[0]
+            if base_name not in self._q_tensors:
+                self._q_tensors[base_name] = {}
+            self._q_tensors[base_name]["qweight"] = data_torch.numpy().astype(np.int32)
+            return []
+
+        if bid is not None and name.endswith(".qzeros"):
+            base_name = name.rsplit(".", 1)[0]
+            if base_name not in self._q_tensors:
+                self._q_tensors[base_name] = {}
+            self._q_tensors[base_name]["qzeros"] = data_torch.numpy().astype(np.int32)
+            return []
+
+        if bid is not None and name.endswith(".scales"):
+            base_name = name.rsplit(".", 1)[0]
+            if base_name not in self._q_tensors:
+                self._q_tensors[base_name] = {}
+            self._q_tensors[base_name]["scales"] = data_torch.numpy().astype(np.float32)
+            return []
+
+        # Handle indexer tensors specially (they don't map through standard tensor mapping)
+        if bid is not None and "indexer." in name:
+            gguf_name = self._hf_to_gguf_indexer(name, bid)
+            if gguf_name is None:
+                return []
+            return [(gguf_name, data_torch)]
+
+        # Handle expert gating bias (e_score_correction_bias -> exp_probs_b)
+        if name.endswith("e_score_correction_bias"):
+            new_name = f"blk.{bid}.exp_probs_b"
+            return [(new_name, data_torch)]
+
+        # For all other tensors, map to GGUF names
+        new_name = self.map_tensor_name(name)
+        return [(new_name, data_torch)]
+
+    def _process_q_tensors(self, bid: int) -> list[tuple[str, np.ndarray]]:
+        """Dequantize and return quantized tensors for a given block."""
+        tensors: list[tuple[str, np.ndarray]] = []
+
+        # Process all quantized tensors for this block
+        to_remove = []
+        for base_name, components in self._q_tensors.items():
+            if bid not in base_name:
+                continue
+
+            if "qweight" in components and "qzeros" in components and "scales" in components:
+                dequantized = self._dequantize_gptq(
+                    components["qweight"], components["qzeros"], components["scales"]
+                )
+                to_remove.append(base_name)
+
+                # Determine the GGUF name
+                if "indexer" in base_name:
+                    # Extract the indexer component type
+                    if "wk" in base_name:
+                        gguf_name = f"blk.{bid}.indexer.attn_k"
+                    elif "wq_b" in base_name:
+                        gguf_name = f"blk.{bid}.indexer.attn_q_b"
+                    else:
+                        continue
+                    tensors.append((gguf_name, dequantized.astype(np.float32)))
+                elif "q_a_proj" in base_name:
+                    tensors.append((f"blk.{bid}.attn_q_a.weight", dequantized.astype(np.float32)))
+                elif "q_b_proj" in base_name:
+                    tensors.append((f"blk.{bid}.attn_q_b.weight", dequantized.astype(np.float32)))
+                elif "kv_a_proj" in base_name:
+                    tensors.append((f"blk.{bid}.attn_kv_a_mqa.weight", dequantized.astype(np.float32)))
+                elif "kv_b_proj" in base_name:
+                    tensors.append((f"blk.{bid}.attn_k_b.weight", dequantized.astype(np.float32)))
+                else:
+                    # Try to map the base name to a GGUF tensor name
+                    gguf_name = self._hf_to_gguf_indexer(base_name, bid)
+                    if gguf_name:
+                        tensors.append((gguf_name, dequantized.astype(np.float32)))
+
+        for base_name in to_remove:
+            del self._q_tensors[base_name]
+
+        return tensors
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, torch.Tensor]]:
+        """Yield dequantized and merged tensors."""
+        for bid in list(self._q_tensors.keys()):
+            for gguf_name, data in self._process_q_tensors(bid):
+                yield (gguf_name, torch.from_numpy(data.astype(np.float32)))
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+@Model.register("ChatGLMModel", "ChatGLMForConditionalGeneration")
+class ChatGLMModel(Model):
+    model_arch = gguf.MODEL_ARCH.CHATGLM
+
     def set_vocab_chatglm3(self):
         dir_model = self.dir_model
         hparams = self.hparams

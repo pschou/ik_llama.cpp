@@ -93,6 +93,9 @@ class Keys:
         EXPERT_WEIGHTS_SCALE              = "{arch}.expert_weights_scale"
         EXPERT_WEIGHTS_NORM               = "{arch}.expert_weights_norm"
         EXPERT_GATING_FUNC                = "{arch}.expert_gating_func"
+        INDEXER_HEAD_COUNT                = "{arch}.attention.indexer.head_count"
+        INDEXER_KEY_LENGTH                = "{arch}.attention.indexer.key_length"
+        INDEXER_TOP_K                     = "{arch}.attention.indexer.top_k"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
         POOLING_TYPE                      = "{arch}.pooling_type"
         LOGIT_SCALE                       = "{arch}.logit_scale"
@@ -109,6 +112,8 @@ class Keys:
         CLAMP_KQV         = "{arch}.attention.clamp_kqv"
         KEY_LENGTH        = "{arch}.attention.key_length"
         VALUE_LENGTH      = "{arch}.attention.value_length"
+        KEY_LENGTH_MLA    = "{arch}.attention.key_length_mla"
+        VALUE_LENGTH_MLA  = "{arch}.attention.value_length_mla"
         LAYERNORM_EPS     = "{arch}.attention.layer_norm_epsilon"
         LAYERNORM_RMS_EPS = "{arch}.attention.layer_norm_rms_epsilon"
         CAUSAL            = "{arch}.attention.causal"
@@ -1308,6 +1313,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.INDEXER_K_NORM_WEIGHT,
         MODEL_TENSOR.INDEXER_K_NORM_BIAS,
         MODEL_TENSOR.INDEXER_PROJ,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
         # NextN/MTP tensors - preserved but unused
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
