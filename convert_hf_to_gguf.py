@@ -2299,6 +2299,37 @@ class Qwen3NextModel(Qwen2MoeModel):
             if max_eid >= 0:
                 self.hparams["num_experts"] = max_eid + 1
 
+    def prepare_tensors(self):
+        # Fix: for Qwen3Next, post_attention_layernorm should map to ATTN_POST_NORM
+        # (the base tensor_force gives it to FFN_NORM due to enum ordering).
+        for bid in range(self.block_count):
+            key = f"model.layers.{bid}.post_attention_layernorm"
+            if key in self.tensor_map.mapping:
+                self.tensor_map.mapping[key] = (
+                    gguf.MODEL_TENSOR.ATTN_POST_NORM,
+                    f"blk.{bid}.post_attention_norm",
+                )
+
+        # Qwen-Coder-Next linear-only blocks use in_proj_qkvz which must NOT
+        # map to ATTN_QKV (wrong shape). Map Q/K/V/Z to their own tensor types
+        # via tensor_force so they get correct GGUF keys.  Also handle in_proj_qkv
+        # (Qwen3.5/3.6 linear blocks) and in_proj_ba → ssm_ba (Qwen3Next).
+        for bid in range(self.block_count):
+            for tensor_type, gguf_key, gguf_name in [
+                (gguf.MODEL_TENSOR.ATTN_Q, "model.layers.{bid}.linear_attn.in_proj_qkvz.weight", "blk.{bid}.attn_q"),
+                (gguf.MODEL_TENSOR.ATTN_K, "model.layers.{bid}.linear_attn.in_proj_qkvz.weight", "blk.{bid}.attn_k"),
+                (gguf.MODEL_TENSOR.ATTN_V, "model.layers.{bid}.linear_attn.in_proj_qkvz.weight", "blk.{bid}.attn_v"),
+                (gguf.MODEL_TENSOR.ATTN_GATE, "model.layers.{bid}.linear_attn.in_proj_z.weight", "blk.{bid}.attn_gate"),
+                (gguf.MODEL_TENSOR.SSM_BETA_ALPHA, "model.layers.{bid}.linear_attn.in_proj_ba.weight", "blk.{bid}.ssm_ba"),
+                (gguf.MODEL_TENSOR.ATTN_Q, "model.layers.{bid}.linear_attn.in_proj_qkv.weight", "blk.{bid}.attn_q"),
+                (gguf.MODEL_TENSOR.ATTN_K, "model.layers.{bid}.linear_attn.in_proj_qkv.weight", "blk.{bid}.attn_k"),
+                (gguf.MODEL_TENSOR.ATTN_V, "model.layers.{bid}.linear_attn.in_proj_qkv.weight", "blk.{bid}.attn_v"),
+            ]:
+                key = gguf_key.format(bid=bid)
+                self.tensor_map.mapping[key] = (tensor_type, gguf_name.format(bid=bid))
+
+        super().prepare_tensors()
+
     def modify_tensors(
         self, data_torch: Tensor, name: str, bid: int | None
     ) -> Iterable[tuple[str, Tensor]]:
@@ -2336,7 +2367,8 @@ class Qwen3NextModel(Qwen2MoeModel):
                 num_v_per_k = num_v_heads // num_k_heads
 
                 if name.endswith(".linear_attn.in_proj_qkvz.weight"):
-                    # Combined QKVZ tensor: [n_q + n_k + n_v + n_z, hidden_size]
+                    # Qwen3Next linear-attn blocks ship QKVZ in a single tensor.
+                    # Split into separate Q/K/V/Z tensors.
                     n_q = head_k_dim * num_k_heads
                     n_k = head_k_dim * num_k_heads
                     n_v = head_v_dim * num_v_heads
@@ -2346,8 +2378,17 @@ class Qwen3NextModel(Qwen2MoeModel):
                     v = data_torch[n_q + n_k:n_q + n_k + n_v]
                     z = data_torch[n_q + n_k + n_z:]
                     v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
-                    # Combine back and let map_tensor_name handle it as ATTN_QKV
-                    data_torch = torch.cat([q, k, v, z], dim=0)
+                    base_qkvz = name[:-len(".weight")]  # model.layers.{bid}.linear_attn.in_proj_qkvz
+                    # Replace 'in_proj_qkvz' with the correct suffix for each component
+                    q_base = base_qkvz.replace("in_proj_qkvz", "q_proj")  # model.layers.{bid}.linear_attn.q_proj
+                    k_base = base_qkvz.replace("in_proj_qkvz", "k_proj")
+                    v_base = base_qkvz.replace("in_proj_qkvz", "v_proj")
+                    z_base = base_qkvz.replace("in_proj_qkvz", "in_proj_z")
+                    yield (self.map_tensor_name(q_base + ".weight"), q.contiguous())
+                    yield (self.map_tensor_name(k_base + ".weight"), k.contiguous())
+                    yield (self.map_tensor_name(v_base + ".weight"), v.contiguous())
+                    yield (self.map_tensor_name(z_base + ".weight"), z.contiguous())
+                    return
                 elif name.endswith(".linear_attn.in_proj_qkv.weight"):
                     q_dim = head_k_dim * num_k_heads
                     k_dim = head_k_dim * num_k_heads
@@ -2359,22 +2400,13 @@ class Qwen3NextModel(Qwen2MoeModel):
                 elif name.endswith(".linear_attn.in_proj_z.weight"):
                     data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
                 elif name.endswith(".linear_attn.in_proj_ba.weight"):
-                    # Split combined in_proj_ba into separate B and A tensors.
-                    # in_proj_ba has shape [2 * num_value_heads, hidden_size];
-                    # B = [:num_value_heads], A = [num_value_heads:]
-                    half = num_v_heads
-                    b = data_torch[:half].contiguous()
-                    a = data_torch[half:].contiguous()
-                    # Each is [num_value_heads, hidden_size]; transpose to [hidden_size, num_value_heads]
-                    b_t = b.permute(1, 0).contiguous()
-                    a_t = a.permute(1, 0).contiguous()
-                    # Yield directly so super() doesn't get called
-                    base = name[:-len(".weight")]
-                    # Replace 'in_proj_ba' with 'in_proj_b'/'in_proj_a' in the name
-                    mapped_b = self.map_tensor_name(base.replace("in_proj_ba", "in_proj_b") + ".weight")
-                    mapped_a = self.map_tensor_name(base.replace("in_proj_ba", "in_proj_a") + ".weight")
-                    yield (mapped_b, b_t)
-                    yield (mapped_a, a_t)
+                    # Qwen3Next expects a single combined ssm_ba tensor.
+                    # Source [2*num_v_heads, hidden_size] = [64, 2048].
+                    # GGUF stores shape in reverse, so [64, 2048] → GGUF [2048, 64] = expected.
+                    gguf_name = self.format_tensor_name(
+                        gguf.MODEL_TENSOR.SSM_BETA_ALPHA, bid, ".weight"
+                    )
+                    yield (gguf_name, data_torch.contiguous())
                     return
                 elif name.endswith(".linear_attn.in_proj_b.weight") or name.endswith(".linear_attn.in_proj_a.weight"):
                     data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
@@ -2392,8 +2424,10 @@ class Qwen3NextModel(Qwen2MoeModel):
                     v_part = data[qk_channels:]
                     v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
                     data_torch = torch.cat([qk_part, v_part], dim=0)
-                    # GGUF reverses numpy shapes, so transpose to get correct conv shape in GGUF
-                    data_torch = data_torch.T
+                    # GGUF stores shape in reverse. To get GGUF shape [4, 8192, 1, 1],
+                    # we pass shape [1, 1, 8192, 4]. Data layout stays the same since
+                    # element [i, j] in [8192, 4] = element [1, 1, i, j] in [1, 1, 8192, 4].
+                    data_torch = data_torch.reshape(1, 1, *data_torch.shape)
                 elif name.endswith(".linear_attn.out_proj.weight"):
                     data_torch = self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
 
@@ -2402,7 +2436,7 @@ class Qwen3NextModel(Qwen2MoeModel):
                 data_torch = -torch.exp(data_torch)
             elif name.endswith(".dt_bias"):
                 name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
-            elif name.endswith(".conv1d.weight"):
+            elif name.endswith(".ssm_conv1d.weight"):
                 data_torch = data_torch.squeeze()
 
         yield from super().modify_tensors(data_torch, name, bid)
@@ -2511,13 +2545,15 @@ class Qwen3_5TextModel(Qwen2Model):
                     v_part = data[qk_channels:]
                     v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
                     data_torch = torch.cat([data[:qk_channels], v_part], dim=0)
-                    # GGUF reverses numpy shapes, so transpose to get correct conv shape in GGUF
-                    data_torch = data_torch.T
+                    # GGUF stores shape in reverse. To get GGUF shape [4, 8192, 1, 1],
+                    # we pass shape [1, 1, 8192, 4]. Data layout stays the same since
+                    # element [i, j] in [8192, 4] = element [1, 1, i, j] in [1, 1, 8192, 4].
+                    data_torch = data_torch.reshape(1, 1, *data_torch.shape)
             if name.endswith(".A_log"):
                 data_torch = -torch.exp(data_torch)
             elif name.endswith(".dt_bias"):
                 name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
-            elif name.endswith(".conv1d.weight"):
+            elif name.endswith(".ssm_conv1d.weight"):
                 data_torch = data_torch.squeeze()
 
         yield from super().modify_tensors(data_torch, name, bid)
@@ -2542,6 +2578,10 @@ class Qwen3_5TextModel(Qwen2Model):
         self.gguf_writer.add_rope_dimension_count(int(head_dim * partial))
 
         if (mrope_section := rope_params.get("mrope_section")) is not None:
+            # ggml_rope_multi expects exactly GGML_MROPE_SECTIONS (=4) entries
+            # and llama-hparams.h declares std::array<int, 4>. HF ships 3 dims
+            # for 3D mRoPE (temporal/height/width); pad the 4th with 0, matching
+            # upstream llama.cpp's convention (convert_hf_to_gguf.py:1147).
             mrope_section = list(mrope_section)
             while len(mrope_section) < 4:
                 mrope_section.append(0)
@@ -2572,7 +2612,49 @@ class Qwen3_5TextModel(Qwen2Model):
                     gguf.MODEL_TENSOR.ATTN_POST_NORM,
                     f"blk.{bid}.post_attention_norm",
                 )
+
+        # Qwen3.5 linear-only blocks: write in_proj_qkv as attn_qkv.weight (not split).
+        # llama.cpp's QWEN35 loader expects combined QKV tensor for linear blocks.
+        for bid in range(self.block_count):
+            key = f"model.layers.{bid}.linear_attn.in_proj_qkv.weight"
+            self.tensor_map.mapping[key] = (
+                gguf.MODEL_TENSOR.ATTN_QKV,
+                f"blk.{bid}.attn_qkv.weight",
+            )
+
+        # Map in_proj_z → attn_gate.weight for linear blocks
+        for bid in range(self.block_count):
+            key = f"model.layers.{bid}.linear_attn.in_proj_z.weight"
+            self.tensor_map.mapping[key] = (
+                gguf.MODEL_TENSOR.ATTN_GATE,
+                f"blk.{bid}.attn_gate.weight",
+            )
+
+        # Map o_proj.weight → attn_output.weight for standard blocks
+        for bid in range(self.block_count):
+            key = f"model.layers.{bid}.self_attn.o_proj.weight"
+            self.tensor_map.mapping[key] = (
+                gguf.MODEL_TENSOR.ATTN_OUTPUT,
+                f"blk.{bid}.attn_output.weight",
+            )
+
         super().prepare_tensors()
+
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        # Qwen3.5/3.6 standard attention blocks don't have SSM tensors
+        # in the HF source. llama.cpp's QWEN35 loader expects SSM tensors
+        # only for linear blocks, so we skip dummy generation here.
+        yield from super().get_tensors()
+
+    def tensor_force_quant(self, name, new_name, bid, n_dims):
+        # The CPU ggml_ssm_conv kernel asserts that its conv1d weight is F32
+        # (nb[0] == sizeof(float)). HF ships this tensor as bf16 so force F32
+        # at convert time, matching upstream llama.cpp.
+        if bid is not None and new_name == self.format_tensor_name(
+            gguf.MODEL_TENSOR.SSM_CONV1D, bid, ".weight" if name.endswith(".weight") else ""
+        ):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     @staticmethod
     def _reorder_v_heads(tensor: Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> Tensor:
@@ -2654,7 +2736,8 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
                 num_v_per_k = num_v_heads // num_k_heads
 
                 if name.endswith(".linear_attn.in_proj_qkvz.weight"):
-                    # Combined QKVZ tensor: [n_q + n_k + n_v + n_z, hidden_size]
+                    # Qwen3Next linear-attn blocks ship QKVZ in a single tensor.
+                    # Split into separate Q/K/V/Z tensors.
                     n_q = head_k_dim * num_k_heads
                     n_k = head_k_dim * num_k_heads
                     n_v = head_v_dim * num_v_heads
@@ -2664,8 +2747,17 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
                     v = data_torch[n_q + n_k:n_q + n_k + n_v]
                     z = data_torch[n_q + n_k + n_z:]
                     v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
-                    # Combine back and let map_tensor_name handle it as ATTN_QKV
-                    data_torch = torch.cat([q, k, v, z], dim=0)
+                    base_qkvz = name[:-len(".weight")]  # model.layers.{bid}.linear_attn.in_proj_qkvz
+                    # Replace 'in_proj_qkvz' with the correct suffix for each component
+                    q_base = base_qkvz.replace("in_proj_qkvz", "q_proj")  # model.layers.{bid}.linear_attn.q_proj
+                    k_base = base_qkvz.replace("in_proj_qkvz", "k_proj")
+                    v_base = base_qkvz.replace("in_proj_qkvz", "v_proj")
+                    z_base = base_qkvz.replace("in_proj_qkvz", "in_proj_z")
+                    yield (self.map_tensor_name(q_base + ".weight"), q.contiguous())
+                    yield (self.map_tensor_name(k_base + ".weight"), k.contiguous())
+                    yield (self.map_tensor_name(v_base + ".weight"), v.contiguous())
+                    yield (self.map_tensor_name(z_base + ".weight"), z.contiguous())
+                    return
                 elif name.endswith(".linear_attn.in_proj_qkv.weight"):
                     q_dim = head_k_dim * num_k_heads
                     k_dim = head_k_dim * num_k_heads
@@ -2677,21 +2769,14 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
                 elif name.endswith(".linear_attn.in_proj_z.weight"):
                     data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
                 elif name.endswith(".linear_attn.in_proj_ba.weight"):
-                    # Split combined in_proj_ba into separate B and A tensors.
-                    # in_proj_ba has shape [2 * num_value_heads, hidden_size];
-                    # B = [:num_value_heads], A = [num_value_heads:]
-                    half = num_v_heads
-                    b = data_torch[:half].contiguous()
-                    a = data_torch[half:].contiguous()
-                    # Each is [num_value_heads, hidden_size]; transpose to [hidden_size, num_value_heads]
-                    b_t = b.permute(1, 0).contiguous()
-                    a_t = a.permute(1, 0).contiguous()
-                    # Yield directly so super() doesn't get called
-                    base = name[:-len(".weight")]
-                    mapped_b = self.map_tensor_name(base.replace("in_proj_ba", "in_proj_b") + ".weight")
-                    mapped_a = self.map_tensor_name(base.replace("in_proj_ba", "in_proj_a") + ".weight")
-                    yield (mapped_b, b_t)
-                    yield (mapped_a, a_t)
+                    # Qwen3Next/3.5/3.6 expects a single combined ssm_ba tensor.
+                    # Source [2*num_v_heads, hidden_size].
+                    # GGUF stores shape in reverse, so [2*num_v_heads, hidden_size]
+                    # → GGUF [hidden_size, 2*num_v_heads] = expected.
+                    gguf_name = self.format_tensor_name(
+                        gguf.MODEL_TENSOR.SSM_BETA_ALPHA, bid, ".weight"
+                    )
+                    yield (gguf_name, data_torch.contiguous())
                     return
                 elif name.endswith(".linear_attn.in_proj_b.weight") or name.endswith(".linear_attn.in_proj_a.weight"):
                     data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
@@ -2709,8 +2794,10 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
                     v_part = data[qk_channels:]
                     v_part = self._reorder_v_heads(v_part, 0, num_k_heads, num_v_per_k, head_v_dim)
                     data_torch = torch.cat([qk_part, v_part], dim=0)
-                    # GGUF reverses numpy shapes, so transpose to get correct conv shape in GGUF
-                    data_torch = data_torch.T
+                    # GGUF stores shape in reverse. To get GGUF shape [4, 8192, 1, 1],
+                    # we pass shape [1, 1, 8192, 4]. Data layout stays the same since
+                    # element [i, j] in [8192, 4] = element [1, 1, i, j] in [1, 1, 8192, 4].
+                    data_torch = data_torch.reshape(1, 1, *data_torch.shape)
                     # Remaining transforms below expect the name; fall through to
                     # the numeric/rename block so super() gets the squeezed tensor.
                 elif name.endswith(".linear_attn.out_proj.weight"):
@@ -2727,7 +2814,7 @@ class Qwen3_5MoeTextModel(Qwen3NextModel):
                 # Rename dt_bias -> dt_proj.bias so the standard SSM_DT mapping
                 # picks it up as a .bias suffix and emits blk.N.ssm_dt.bias.
                 name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
-            elif name.endswith(".conv1d.weight"):
+            elif name.endswith(".ssm_conv1d.weight"):
                 # conv1d weight ships as (C, 1, K); ggml_ssm_conv expects (C, K).
                 # Note: if we reordered above the squeeze is already applied;
                 # calling squeeze() on an already-2D tensor is a no-op.

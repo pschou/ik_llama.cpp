@@ -127,8 +127,6 @@ class TensorNameMap:
             "transformer.blocks.{bid}.attn.Wqkv",                                  # mpt
             "transformer.blocks.{bid}.norm_attn_norm.attn.Wqkv",                   # dbrx
             "transformer.h.{bid}.self_attention.query_key_value",                  # falcon
-            "model.layers.{bid}.linear_attn.in_proj_qkv",                          # qwen3.5 / qwen3.6 linear_attn QKV
-            "model.layers.{bid}.linear_attn.in_proj_qkvz",                         # qwen3-next linear_attn QKVZ
             "h.{bid}.self_attention.query_key_value",                              # bloom
             "language_model.encoder.layers.{bid}.self_attention.query_key_value",  # persimmon
             "model.layers.{bid}.self_attn.query_key_value",                        # persimmon
@@ -152,6 +150,7 @@ class TensorNameMap:
             "model.layers.{bid}.attention.wq",                           # internlm2
             "transformer.decoder_layer.{bid}.multi_head_attention.query",# Grok
             "model.layers.{bid}.q_proj",                                  # qwen3-next (flat attention)
+            "model.layers.{bid}.linear_attn.q_proj",                     # qwen3-next linear-attn Q component
         ),
 
         # Attention key
@@ -165,6 +164,7 @@ class TensorNameMap:
             "model.layers.{bid}.attention.wk",                         # internlm2
             "transformer.decoder_layer.{bid}.multi_head_attention.key",# Grok
             "model.layers.{bid}.k_proj",                                  # qwen3-next (flat attention)
+            "model.layers.{bid}.linear_attn.k_proj",                     # qwen3-next linear-attn K component
         ),
 
         # Attention value
@@ -178,6 +178,7 @@ class TensorNameMap:
             "model.layers.{bid}.attention.wv",                           # internlm2
             "transformer.decoder_layer.{bid}.multi_head_attention.value", # Grok
             "model.layers.{bid}.v_proj",                                  # qwen3-next (flat attention)
+            "model.layers.{bid}.linear_attn.v_proj",                     # qwen3-next linear-attn V component
         ),
 
         # Attention output

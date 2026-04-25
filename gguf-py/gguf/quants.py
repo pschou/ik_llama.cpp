@@ -228,7 +228,7 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         d = max / -8
         eps = 1e-12  # small value to avoid divide by zero
         with np.errstate(divide="ignore"):
-            id = np.where(d == 0, 0, 1 / (d - eps))
+            id = np.where(np.abs(d) <= eps, 0, 1 / d)
         # FIXME: Q4_0's reference rounding is cursed and depends on FMA
         qs = np.trunc((np.float64(blocks) * np.float64(id)) + np.float64(8.5), dtype=np.float32).astype(np.uint8).clip(0, 15)
 
@@ -264,7 +264,7 @@ class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
         d = (max - min) / 15
         eps = 1e-12  # small value to avoid divide by zero
         with np.errstate(divide="ignore"):
-            id = np.where(d == 0, 0, 1 / (d - eps))
+            id = np.where(np.abs(d) <= eps, 0, 1 / d)
         qs = np.trunc((blocks - min) * id + np.float32(0.5), dtype=np.float32).astype(np.uint8).clip(0, 15)
 
         qs = qs.reshape((n_blocks, 2, cls.block_size // 2))
@@ -302,7 +302,7 @@ class Q5_0(__Quant, qtype=GGMLQuantizationType.Q5_0):
         d = max / -16
         eps = 1e-12  # small value to avoid divide by zero
         with np.errstate(divide="ignore"):
-            id = np.where(d == 0, 0, 1 / (d - eps))
+            id = np.where(np.abs(d) <= eps, 0, 1 / d)
         # FIXME: Q5_0's reference rounding is cursed and depends on FMA
         q = np.trunc((np.float64(blocks) * np.float64(id)) + np.float64(16.5), dtype=np.float32).astype(np.uint8).clip(0, 31)
 
@@ -346,7 +346,7 @@ class Q5_1(__Quant, qtype=GGMLQuantizationType.Q5_1):
         d = (max - min) / 31
         eps = 1e-12  # small value to avoid divide by zero
         with np.errstate(divide="ignore"):
-            id = np.where(d == 0, 0, 1 / (d - eps))
+            id = np.where(np.abs(d) <= eps, 0, 1 / d)
         q = np.trunc((blocks - min) * id + np.float32(0.5), dtype=np.float32).astype(np.uint8).clip(0, 31)
 
         qs = q.reshape((n_blocks, 2, cls.block_size // 2))
@@ -392,7 +392,7 @@ class Q6_0(__Quant, qtype=GGMLQuantizationType.Q6_0):
         d = max / -32
         eps = 1e-12  # small value to avoid divide by zero
         with np.errstate(divide="ignore"):
-            id = np.where(d == 0, 0, 1 / (d - eps))
+            id = np.where(np.abs(d) <= eps, 0, 1 / d)
         # Adapted from Q5_0
         q = np.trunc((np.float64(blocks) * np.float64(id)) + np.float64(32.5), dtype=np.float32).astype(np.uint8).clip(0, 63)
 
@@ -416,7 +416,7 @@ class Q8_0(__Quant, qtype=GGMLQuantizationType.Q8_0):
         d = abs(blocks).max(axis=1, keepdims=True) / 127
         eps = 1e-12  # small value to avoid divide by zero
         with np.errstate(divide="ignore"):
-            id = np.where(d == 0, 0, 1 / (d - eps))
+            id = np.where(np.abs(d) <= eps, 0, 1 / d)
         qs = np_roundf(blocks * id)
 
         # (n_blocks, 2)
