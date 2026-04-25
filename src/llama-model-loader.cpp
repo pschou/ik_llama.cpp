@@ -20,6 +20,7 @@
 #include <set>
 #include <map>
 #include <array>
+#include <cstring>
 #include <charconv>
 #include <future>
 #include <regex>
@@ -1278,6 +1279,76 @@ template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::str
 template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
 template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
 template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
+
+std::array<int, 4> llama_model_loader::get_rope_sections(const std::array<int, 4> & default_values, bool required) {
+    std::string search_key;
+    const int n_kv = gguf_get_n_kv(meta);
+
+    // Discover the architecture prefix by scanning for any key with ".rope." in its name
+    for (int i = 0; i < n_kv; ++i) {
+        const char *key = gguf_get_key(meta, i);
+        const char *rope_dot = strstr(key, ".rope.");
+        if (rope_dot) {
+            search_key = std::string(key, rope_dot - key);
+            break;
+        }
+    }
+
+    search_key += search_key.empty() ? "" : ".";
+    search_key += "rope.dimension_sections";
+
+    const int kid = gguf_find_key(meta, search_key.c_str());
+
+    if (kid < 0) {
+        if (required) {
+            throw std::runtime_error(format(
+                "GGUF file is missing mandatory field 'rope.dimension_sections'. "
+                "This field is REQUIRED for models that use dimensioned rope scaling. "
+                "Without it, the model cannot function correctly. "
+                "The tool that produced this GGUF file is broken - it must export rope.dimension_sections. "
+                "Do NOT use this model file. Re-export with rope.dimension_sections properly set."));
+        } else {
+            fprintf(stderr, "WARNING: rope.dimension_sections not found in GGUF, using default section sizes=[%d, %d, %d, %d]. "
+                    "Malformed GGUF files may produce unexpected behavior and should not be used in production. "
+                    "The tools that produced this file should include rope.dimension_sections.\n",
+                    default_values[0], default_values[1], default_values[2], default_values[3]);
+            return default_values;
+        }
+    }
+
+    const enum gguf_type type = gguf_get_kv_type(meta, kid);
+    uint32_t n_sections = 3;
+
+    if (type == GGUF_TYPE_ARRAY) {
+        n_sections = static_cast<uint32_t>(gguf_get_arr_n(meta, kid));
+    } else {
+        n_sections = static_cast<uint32_t>(gguf_get_val_i64(meta, kid));
+        if (n_sections == 0) {
+            n_sections = 3;
+        }
+    }
+
+    if (n_sections > 4) {
+        throw std::runtime_error(format("rope.dimension_sections has %u sections (> 4)", n_sections));
+    }
+
+    std::array<int, 4> result;
+    std::fill(result.begin(), result.end(), 0);
+
+    if (type == GGUF_TYPE_ARRAY) {
+        const int32_t *arr_data = static_cast<const int32_t *>(gguf_get_arr_data(meta, kid));
+        for (uint32_t i = 0; i < n_sections; ++i) {
+            result[i] = arr_data[i];
+        }
+    } else {
+        const int64_t val = gguf_get_val_i64(meta, kid);
+        for (uint32_t i = 0; i < n_sections; ++i) {
+            result[i] = static_cast<int>(val);
+        }
+    }
+
+    return result;
+}
 
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(enum llm_kv, unsigned int&, bool);
 

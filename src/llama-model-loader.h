@@ -130,6 +130,8 @@ struct llama_model_loader {
     template<typename T>
     bool get_key_or_arr(const enum llm_kv kid, T & result, uint32_t n, const bool required = true);
 
+    std::array<int, 4> get_rope_sections(const std::array<int, 4> & default_values, bool required = true);
+
     const std::string& get_arch_name() const { return arch_name; }
 
     enum llm_arch get_arch() const { return llm_kv.arch; }

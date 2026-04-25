@@ -7,88 +7,6 @@
 
 #define LLAMA_MAX_EXPERTS 512  // Qwen3 Next
 
-// Helper to load rope dimension sections dynamically
-// Determines the number of sections by scanning the rope.dimension_sections GGUF key:
-// - If array: uses array length as section count, reads array values
-// - If scalar: uses scalar value as count (broadcasts value to all sections)
-// - If not present: uses the provided default value (or zeros if !required)
-static void llm_load_rope_sections(llama_model_loader & ml, std::array<int, 4> & rope_sections, const std::array<int, 4> & default_values, bool required = true) {
-    // Search for the key with any architecture prefix (e.g., "qwen35moe.rope.dimension_sections")
-    // or without a prefix ("rope.dimension_sections") for compatibility
-    std::string search_key;
-    const int n_kv = gguf_get_n_kv(ml.meta);
-
-    // Try to find a key with the "rope." suffix pattern and extract its prefix
-    for (int i = 0; i < n_kv; ++i) {
-        const char *key = gguf_get_key(ml.meta, i);
-        const char *rope_dot = strstr(key, ".rope.");
-        if (rope_dot) {
-            // Extract the prefix before ".rope."
-            size_t prefix_len = rope_dot - key;
-            search_key = std::string(key, prefix_len);
-            break;
-        }
-    }
-
-    search_key += search_key.empty() ? "" : ".";
-    search_key += "rope.dimension_sections";
-
-    const int kid = gguf_find_key(ml.meta, search_key.c_str());
-
-    if (kid < 0) {
-        if (required) {
-            throw std::runtime_error(format(
-                "GGUF file is missing mandatory field 'rope.dimension_sections'. "
-                "This field is REQUIRED for models that use dimensioned rope scaling. "
-                "Without it, the model cannot function correctly. "
-                "The tool that produced this GGUF file is broken - it must export rope.dimension_sections. "
-                "Do NOT use this model file. Re-export with rope.dimension_sections properly set."));
-        } else {
-            fprintf(stderr, "WARNING: rope.dimension_sections not found in GGUF, using default section sizes=[%d, %d, %d, %d]. "
-                    "Malformed GGUF files may produce unexpected behavior and should not be used in production. "
-                    "The tools that produced this file should include rope.dimension_sections.\n",
-                    default_values[0], default_values[1], default_values[2], default_values[3]);
-            // Fallback: use provided default values (not zeros, as the model needs actual values)
-            rope_sections = default_values;
-        }
-        return;
-    }
-
-    // Determine section count from the GGUF metadata
-    const enum gguf_type type = gguf_get_kv_type(ml.meta, kid);
-    uint32_t n_sections = 3; // default fallback when GGUF key is missing
-
-    if (type == GGUF_TYPE_ARRAY) {
-        n_sections = static_cast<uint32_t>(gguf_get_arr_n(ml.meta, kid));
-    } else {
-        // For scalar values, use the value itself as count
-        n_sections = static_cast<uint32_t>(gguf_get_val_i64(ml.meta, kid));
-        if (n_sections == 0) {
-            n_sections = 3;
-        }
-    }
-
-    if (n_sections > 4) {
-        throw std::runtime_error(format("rope.dimension_sections has %u sections (> 4)", n_sections));
-    }
-
-    if (type == GGUF_TYPE_ARRAY) {
-        // Read the actual array values
-        const int32_t *arr_data = static_cast<const int32_t *>(gguf_get_arr_data(ml.meta, kid));
-        for (uint32_t i = 0; i < n_sections; ++i) {
-            rope_sections[i] = arr_data[i];
-        }
-        std::fill(rope_sections.begin() + n_sections, rope_sections.end(), 0);
-    } else {
-        // Scalar case: broadcast the value to all sections
-        const int64_t val = gguf_get_val_i64(ml.meta, kid);
-        for (uint32_t i = 0; i < n_sections; ++i) {
-            rope_sections[i] = static_cast<int>(val);
-        }
-        std::fill(rope_sections.begin() + n_sections, rope_sections.end(), 0);
-    }
-}
-
 static const std::map<llama_rope_scaling_type, const char *> LLAMA_ROPE_SCALING_TYPES = {
     { LLAMA_ROPE_SCALING_TYPE_NONE,   "none"   },
     { LLAMA_ROPE_SCALING_TYPE_LINEAR, "linear" },
@@ -489,7 +407,7 @@ void llm_load_hparams(
             } break;
         case LLM_ARCH_QWEN2VL:
             {
-                llm_load_rope_sections(ml, hparams.rope_sections, {256, 64, 64, 0}, false);
+                hparams.rope_sections = ml.get_rope_sections({256, 64, 64, 0});
             }
             // fall through
         case LLM_ARCH_QWEN2:
@@ -531,7 +449,7 @@ void llm_load_hparams(
         case LLM_ARCH_QWEN3VL:
             {
                 ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, false);
-                llm_load_rope_sections(ml, hparams.rope_sections, {256, 64, 64, 64}, false);
+                hparams.rope_sections = ml.get_rope_sections({256, 64, 64, 64});
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 switch (hparams.n_layer) {
                     case 28: model.type = e_model::MODEL_1_7B; break;
@@ -582,7 +500,7 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
-                llm_load_rope_sections(ml, hparams.rope_sections, {32, 32, 32, 0}, false);
+                hparams.rope_sections = ml.get_rope_sections({32, 32, 32, 0});
 
                 // Load linear attention (gated delta net) parameters
                 ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
@@ -620,7 +538,7 @@ void llm_load_hparams(
         case LLM_ARCH_QWEN35:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-                llm_load_rope_sections(ml, hparams.rope_sections, {32, 32, 32, 0}, false);
+                hparams.rope_sections = ml.get_rope_sections({32, 32, 32, 0});
 
                 // Load linear attention (gated delta net) parameters
                 ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
@@ -658,7 +576,7 @@ void llm_load_hparams(
         case LLM_ARCH_QWEN3VLMOE:
             {
                 ml.get_key(LLM_KV_NUM_DEEPSTACK_LAYERS, hparams.n_deepstack_layers, false);
-                llm_load_rope_sections(ml, hparams.rope_sections, {32, 32, 32, 0}, false);
+                hparams.rope_sections = ml.get_rope_sections({32, 32, 32, 0});
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp, false);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 switch (hparams.n_layer) {
@@ -1401,7 +1319,17 @@ void llm_load_hparams(
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
-                llm_load_rope_sections(ml, hparams.rope_sections, {256, 64, 64, 64}, false);
+                // rope.dimension_sections is optional for GLM_DSA models.
+                // Models like GLM-5.1 that use standard (non-multi-axis) RoPE
+                // may not include it. When missing, default to all-zeros which
+                // causes standard ggml_rope_ext to be used (no dimensioned sections).
+                try {
+                    hparams.rope_sections = ml.get_rope_sections({256, 64, 64, 64});
+                } catch (const std::runtime_error &) {
+                    fprintf(stderr, "WARNING: glm-dsa.rope.dimension_sections not found in GGUF, "
+                            "using standard (non-multi-axis) RoPE.\n");
+                    hparams.rope_sections = {0, 0, 0, 0};
+                }
 
                 // MoE parameters
                 ml.get_key(LLM_KV_EXPERT_COUNT,                hparams.n_expert);
