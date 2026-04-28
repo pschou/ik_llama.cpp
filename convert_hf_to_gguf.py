@@ -5329,6 +5329,25 @@ class LazyTorchTensor(gguf.LazyBase):
         if func is torch.Tensor.numpy:
             return args[0].numpy()
 
+        # Handle dtype conversion (e.g., to(torch.float32)) specially.
+        # The default _wrap_fn path calls .numpy() internally which creates
+        # a LazyNumpyTensor using self._dtype_map[self.dtype] -- but self.dtype
+        # is the ORIGINAL dtype (e.g., bfloat16) which is NOT in _dtype_map.
+        # This produces a LazyNumpyTensor with wrong meta dtype, causing
+        # silent data corruption (zeros) when the lazy chain is later evaluated.
+        # Instead, evaluate the underlying data first, then do the dtype convert
+        # on the evaluated tensor, preserving the correct dtype throughout.
+        if func is torch.Tensor.to and (kwargs.get("dtype") is not None or
+                                         len(args) > 1 and isinstance(args[1], torch.dtype)):
+            target_dtype = kwargs.get("dtype") or args[1]
+            # Get the underlying safetensors slice without going through
+            # __torch_function__ (which would recurse on dtype access etc.)
+            underlying = args[0]._func(*args[0]._args, **(args[0]._kwargs or {}))
+            converted = underlying.to(target_dtype)
+            new = cls(meta=cls.meta_with_dtype_and_shape(target_dtype, converted.shape),
+                      args=(converted,), func=lambda s: s)
+            return new
+
         return cls._wrap_fn(func)(*args, **kwargs)
 
 
