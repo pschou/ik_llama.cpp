@@ -2532,6 +2532,20 @@ class Qwen3_5TextModel(Qwen2Model):
                 head_k_dim = self.hparams["linear_key_head_dim"]
                 head_v_dim = self.hparams["linear_value_head_dim"]
                 num_v_per_k = num_v_heads // num_k_heads
+                if name.endswith(".linear_attn.in_proj_qkv.weight"):
+                    # Split Q/K/V and reorder V heads from grouped-by-K to tiled.
+                    # Q and K have the same dim; V has num_v_heads heads.
+                    q_dim = head_k_dim * num_k_heads
+                    k_dim = head_k_dim * num_k_heads
+                    q = data_torch[:q_dim]
+                    k = data_torch[q_dim:q_dim + k_dim]
+                    v = data_torch[q_dim + k_dim:]
+                    v = self._reorder_v_heads(v, 0, num_k_heads, num_v_per_k, head_v_dim)
+                    data_torch = torch.cat([q, k, v], dim=0)
+                elif name.endswith(".linear_attn.in_proj_z.weight"):
+                    data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
+                elif name.endswith(".linear_attn.in_proj_b.weight") or name.endswith(".linear_attn.in_proj_a.weight"):
+                    data_torch = self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
                 if name.endswith(".linear_attn.A_log") or name.endswith(".linear_attn.dt_bias"):
                     if data_torch.ndim == 1:
                         data_torch = self._reorder_v_heads(
